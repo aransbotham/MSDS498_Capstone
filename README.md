@@ -16,4 +16,3 @@ https://www.kaggle.com/c/microsoft-malware-prediction/data
 
 # Repo Organization
 Code: Directory that contains all EDA and Modeling code. <br/>
-Data: Direcotry that contains pre-processed data files.
