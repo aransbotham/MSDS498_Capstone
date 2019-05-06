@@ -9,10 +9,11 @@ A repo for group collaboration on Northwestern's Masters of Data Science Capston
 * Anna Sheets
 
 # Topic
-_TBD_
+JEAPA Consultants is an IT network consulting firm offering a suite of analytics-based security services. We have been approached by Specter Technology to evaluate ways to protect data on their POS systems from malware infection.
 
 # Data Source
-_TBD_
+https://www.kaggle.com/c/microsoft-malware-prediction/data
 
 # Repo Organization
-_TBD_
+Code: Directory that contains all EDA and Modeling code. <br/>
+Data: Direcotry that contains pre-processed data files.
