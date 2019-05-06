@@ -1,0 +1,431 @@
+---
+title: "MSD ML Draft 2"
+author: "Andrew Kostandy"
+date: "5/5/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(data.table)
+library(tidyverse)
+library(doParallel)
+library(future)
+library(caret)
+library(caretEnsemble)
+library(catboost)
+library(rsample)
+library(recipes)
+library(MLtoolkit)
+library(tictoc)
+library(corrplot)
+theme_set(theme_light())
+```
+
+```{r}
+data_sample <- fread("msd_training.csv", data.table = FALSE, nrows = 20000) # uses 50% of your cores by default
+```
+
+# Training Original Approach - Using 35 selected variables as categorical variables
+
+```{r}
+data_sample <- mutate(data_sample,
+                      HasDetections = as.character(HasDetections),
+                      HasDetections = ifelse(HasDetections == "1", "positive", "negative"),
+                      HasDetections = factor(HasDetections, levels = c("positive", "negative")))
+```
+
+```{r}
+# Partial Cleaning of SmartScreen
+# For levels existing in the first 20K observations
+data_sample <- mutate(data_sample,
+                      SmartScreen = factor(SmartScreen),
+                      SmartScreen = na_if(SmartScreen, ""),
+                      SmartScreen = fct_recode(SmartScreen, "Off" = "off", "On" = "on"))
+```
+
+```{r}
+# Full Cleaning of SmartScreen
+# Not required when using the first 20k observations as some levels aren't present
+# data_sample <- mutate(data_sample,
+#                       SmartScreen = factor(SmartScreen),
+#                       SmartScreen = na_if(SmartScreen, ""),
+#                       SmartScreen = fct_recode(SmartScreen,
+#                                                "x01" = "&#x01;", "x02" = "&#x02;",
+#                                                "Off" = "off", "Off" = "OFF", "On" = "on",
+#                                                "Prompt" = "prompt", "Prompt" = "Promt",
+#                                                "RequireAdmin" = "requireAdmin",
+#                                                "RequireAdmin" = "requireadmin",
+#                                                "0" = "00000000"
+#                                               )
+#                      )
+```
+
+```{r}
+pre_training <- select(data_sample, SmartScreen, AVProductStatesIdentifier, AVProductsInstalled,
+                       AppVersion, EngineVersion, Census_PrimaryDiskTotalCapacity, Census_TotalPhysicalRAM,
+                       Census_OSInstallTypeName, Census_InternalPrimaryDisplayResolutionVertical,
+                       Census_FirmwareManufacturerIdentifier, Census_InternalPrimaryDiagonalDisplaySizeInInches,
+                       Wdft_IsGamer, Census_OEMNameIdentifier, Census_OSBuildRevision, CountryIdentifier,
+                       Census_MDC2FormFactor, Census_OSArchitecture, Census_ProcessorCoreCount, GeoNameIdentifier,
+                       Processor, SMode, Census_InternalPrimaryDisplayResolutionHorizontal,
+                       Census_IsAlwaysOnAlwaysConnectedCapable, Census_PowerPlatformRoleName, Census_ChassisTypeName,
+                       Census_InternalBatteryNumberOfCharges, Census_IsTouchEnabled, IsProtected, IeVerIdentifier,
+                       Census_OSEdition, Census_OSSkuName, Census_OSVersion, Wdft_RegionIdentifier,
+                       Census_ActivationChannel, Census_OSInstallLanguageIdentifier, HasDetections)
+```
+
+```{r}
+# Making NA a level by itself in categorical variables (For variables with NA values)
+# Also manually merging some very rare levels with the closest levels to them
+# Note that those very rare level are very informative of the outcome so alternative approaches could be considered
+# For now, keeping those very rare levels causes problems with cross validation when using the formula method (~)
+pre_training <- pre_training %>%
+  mutate_if(is.numeric, as.factor) %>% 
+  mutate_all(~fct_explicit_na(., na_level = "NA")) %>% 
+  mutate(Census_OSArchitecture = fct_recode(Census_OSArchitecture, "x86"="arm64"), # merge very rare level arm64 with closest level (temporary)
+         Processor = fct_recode(Processor, "x86"="arm64"), # merge very rare level arm64 with closest level x86 (temporary)
+         SMode = fct_recode(SMode, "NA" = "1")) # merge very rare level 1 with closest level NA (temporary)
+```
+
+```{r}
+rec_mod <- recipe(HasDetections ~ ., data = pre_training) %>% 
+  step_other(all_nominal(), -HasDetections, threshold = 0.01) %>% 
+  step_nzv(all_predictors())
+```
+
+```{r}
+prepped_rec <- prep(rec_mod)
+training <- juice(prepped_rec)
+```
+
+```{r}
+training <- as.data.frame(training)
+```
+
+```{r}
+set.seed(7678, kind = "L'Ecuyer-CMRG")
+
+five_stats_summary <- function(...) c(twoClassSummary(...), defaultSummary(...))
+
+id <- createFolds(training$HasDetections, k = 10)
+
+train_ctrl <- trainControl(method = "cv",
+                           number = 10,
+                           index = id,
+                           classProbs = TRUE,
+                           search = "random",
+                           summaryFunction = five_stats_summary,
+                           savePredictions = "final")
+
+```
+
+```{r}
+# 6.5 minutes for 20K observations (10 folds)
+# 40 mins for 100K observations (5 folds)
+
+# XGBoost & C5.0 model training. (Models were tuned previously)
+# Uses dummy variables for categorical variables
+tic() # start timer
+cl <- makeCluster(6) # to use parallel processing. This uses 6 cores.
+registerDoParallel(cl)
+
+ens_list_tuned_form <- caretList(
+  HasDetections ~ .,
+  data = training,
+  trControl=train_ctrl,
+  metric="ROC",
+  tuneList=list(
+    xgboost = caretModelSpec(method = "xgbTree", verbose = FALSE,
+                             tuneGrid = data.frame(nrounds = 601, max_depth = 8,
+                                                   eta = 0.007950796, gamma = 3.062689,
+                                                   colsample_bytree = 0.3694961,
+                                                   min_child_weight = 17,
+                                                   subsample = 0.5076639)),
+    
+    c50 = caretModelSpec(method = "C5.0",
+                         tuneGrid = data.frame(trials = 20, model = "tree",
+                                               winnow = FALSE))
+  )
+)
+
+stopCluster(cl)
+registerDoSEQ()
+toc() # end timer and display time taken
+```
+
+```{r}
+rec_mod_fin <- recipe(HasDetections ~ ., data = training) %>% 
+  step_nzv(all_predictors()) # removes near-zero variance variables (if any) within resampling 
+```
+
+```{r}
+cl.catboost.caret <- catboost.caret
+cl.catboost.caret$method <- "custom_catboost"
+```
+
+```{r, eval=TRUE}
+# 35 minutes on 20K observations (10-fold)
+# 3.11 hours on 100K observations (5-fold)
+
+# Training the rest of the models. (Models were tuned previously)
+tic()
+cl <- makeCluster(6)
+registerDoParallel(cl)
+
+ens_list_tuned_rec <- caretList(
+  rec_mod_fin,
+  data = training,
+  trControl=train_ctrl,
+  metric="ROC",
+  methodList = c("glm"),
+  tuneList=list(
+    ada = caretModelSpec(method = "ada",
+                         tuneGrid = data.frame(iter = 417, maxdepth = 2,
+                                               nu = 0.05018677)),
+    
+    rf = caretModelSpec(method = "rf", tuneGrid = data.frame(mtry = 3)),
+    
+    adabag = caretModelSpec(method = "AdaBag",
+                            tuneGrid = data.frame(mfinal = 92, maxdepth = 28)),
+    
+    nb = caretModelSpec(method = "nb",
+                        tuneGrid = data.frame(fL = 0, usekernel = FALSE, adjust = 1)),
+    
+    catb = caretModelSpec(method = cl.catboost.caret, logging_level = 'Silent',
+                          tuneGrid = data.frame(depth = 2, learning_rate = 0.09494306,
+                                                iterations = 100, l2_leaf_reg = 0.001,
+                                                rsm = 0.9, border_count = 28))
+  )
+)
+
+stopCluster(cl)
+registerDoSEQ()
+toc()
+```
+
+```{r}
+start_loc <- length(ens_list_tuned_rec)
+ens_list_tuned <- ens_list_tuned_rec
+
+for (i in 1:length(ens_list_tuned_form)){
+  ens_list_tuned[start_loc + i] <- ens_list_tuned_form[i]
+  names(ens_list_tuned)[start_loc + i] <- names(ens_list_tuned_form)[i]
+}
+```
+
+```{r}
+# Showing how the different model predictions correlate with one another
+modelCor(resamples(ens_list_tuned))
+```
+
+```{r}
+# Plotting how the different model predictions correlate with one another
+#pdf(file = "models_corrplot.pdf")
+corrplot(modelCor(resamples(ens_list_tuned)), method = "circle", order = "hclust",
+         type = "upper", diag = FALSE)
+#dev.off()
+```
+
+```{r}
+# Creating the ensemble model
+set.seed(9253, kind = "L'Ecuyer-CMRG")
+
+mod_ensemble <- caretEnsemble(
+  ens_list_tuned, 
+  metric = "ROC",
+  trControl = trainControl(
+    method = "cv",
+    number = 10,
+    summaryFunction = five_stats_summary,
+    savePredictions = "final",
+    classProbs = TRUE
+    )
+  )
+
+summary(mod_ensemble)
+```
+
+```{r}
+#  4.6 minutes on 9 models - 20K (10-fold)
+#  ___ minutes on 9 models - 100K (5-fold)
+
+# Evaluating model performance
+tic()
+plan("multiprocess")
+
+mod_list <- list(ens_list_tuned$glm, ens_list_tuned$nb, ens_list_tuned$ada,
+                 ens_list_tuned$rf, ens_list_tuned$adabag, ens_list_tuned$xgboost,
+                 ens_list_tuned$c50, ens_list_tuned$catb, mod_ensemble$ens_model)
+
+mod_names <- c("Logistic Reg.", "Naive Bayes", "Boosted Trees", "Random Forest",
+               "Bagged AdaBoost", "XGBoost", "C5.0", "CatBoost", "Ensemble")
+
+mod_results_ens <- mult_mod_results(mod_list, mod_names)
+plan("sequential")
+toc()
+```
+
+```{r, fig.height=8, fig.width=10.5}
+# Plotting model performance results
+select(mod_results_ens, 1:5) %>% plot_mod_results(ncol = 1, scales = "free") +
+  labs(subtitle = "With 10-fold CV on 20K Observations") +
+  theme(panel.spacing = unit(2, "lines"))
+
+#ggsave("resampling_auroc_sens_spec.pdf",dpi = 458, width = 7, height = 8)
+```
+
+```{r, fig.height=8, fig.width=10.5}
+# Plotting model performance results
+select(mod_results_ens, 1,2,6:8) %>% plot_mod_results(ncol = 1, scales = "free") +
+  labs(title = "Model Performance Comparison (continued)",
+       subtitle = "With 10-fold CV on 20K Observations") +
+  theme(panel.spacing = unit(2, "lines"))
+
+#ggsave("resampling_auprc_prec_f1.pdf",dpi = 458, width = 7, height = 8)
+```
+
+```{r, fig.height=8, fig.width=10.5}
+# Plotting model performance results
+select(mod_results_ens, 1,2,9,11) %>% plot_mod_results(ncol = 1, scales = "free") +
+  labs(title = "Model Performance Comparison (continued)",
+       subtitle = "With 10-fold CV on 20K Observations") +
+  theme(panel.spacing = unit(2, "lines"))
+
+#ggsave("resampling_acc_logloss_mcc.pdf",dpi = 458, width = 7, height = 8)
+```
+
+# Testing Original Approach
+
+```{r}
+test_sample <- fread("msd_training.csv", data.table = FALSE, nrows = 500000)
+test_sample <- slice(test_sample, 100001:500000) # We'll use observations 100,001 to 500,000 as a test set. (400K observations)
+```
+
+```{r}
+test_sample <- mutate(test_sample,
+                      HasDetections = as.character(HasDetections),
+                      HasDetections = ifelse(HasDetections == "1", "positive", "negative"),
+                      HasDetections = factor(HasDetections, levels = c("positive", "negative")))
+```
+
+```{r}
+# Partial Cleaning of SmartScreen
+# For levels existing in the 400K observations used for testing here
+test_sample <- mutate(test_sample,
+                      SmartScreen = factor(SmartScreen),
+                      SmartScreen = na_if(SmartScreen, ""),
+                      SmartScreen = fct_recode(SmartScreen,
+                                               "x01" = "&#x01;", "x02" = "&#x02;",
+                                               "Off" = "off", "Off" = "OFF", "On" = "on"
+                                               )
+                      
+                      )
+                      
+```
+
+```{r}
+# Full Cleaning of SmartScreen
+# Not needed on the 400K obs used for testing here
+# test_sample <- mutate(test_sample,
+#                       SmartScreen = factor(SmartScreen),
+#                       SmartScreen = na_if(SmartScreen, ""),
+#                       SmartScreen = fct_recode(SmartScreen,
+#                                                "x01" = "&#x01;", "x02" = "&#x02;",
+#                                                "Off" = "off", "Off" = "OFF", "On" = "on",
+#                                                "Prompt" = "prompt", "Prompt" = "Promt",
+#                                                "RequireAdmin" = "requireAdmin",
+#                                                "RequireAdmin" = "requireadmin",
+#                                                "0" = "00000000"
+#                                                )
+#                       )
+```
+
+```{r}
+pre_testing <- select(test_sample, SmartScreen, AVProductStatesIdentifier, AVProductsInstalled,
+                       AppVersion, EngineVersion, Census_PrimaryDiskTotalCapacity, Census_TotalPhysicalRAM,
+                       Census_OSInstallTypeName, Census_InternalPrimaryDisplayResolutionVertical,
+                       Census_FirmwareManufacturerIdentifier, Census_InternalPrimaryDiagonalDisplaySizeInInches,
+                       Wdft_IsGamer, Census_OEMNameIdentifier, Census_OSBuildRevision, CountryIdentifier,
+                       Census_MDC2FormFactor, Census_OSArchitecture, Census_ProcessorCoreCount, GeoNameIdentifier,
+                       Processor, SMode, Census_InternalPrimaryDisplayResolutionHorizontal,
+                       Census_IsAlwaysOnAlwaysConnectedCapable, Census_PowerPlatformRoleName, Census_ChassisTypeName,
+                       Census_InternalBatteryNumberOfCharges, Census_IsTouchEnabled, IsProtected, IeVerIdentifier,
+                       Census_OSEdition, Census_OSSkuName, Census_OSVersion, Wdft_RegionIdentifier,
+                       Census_ActivationChannel, Census_OSInstallLanguageIdentifier, HasDetections)
+```
+
+```{r}
+pre_testing <- pre_testing %>%
+  mutate_if(is.numeric, as.factor) %>% 
+  mutate_all(~fct_explicit_na(., na_level = "NA")) %>% 
+  mutate(Census_OSArchitecture = fct_recode(Census_OSArchitecture, "x86" = "arm64"),
+         Processor = fct_recode(Processor, "x86"="arm64"),
+         SMode = fct_recode(SMode, "NA" = "1"))
+```
+
+```{r}
+testing <- bake(prepped_rec, new_data = pre_testing)
+```
+
+```{r}
+# Actual values in 0 and 1 values
+actual <- as.numeric(testing$HasDetections)
+actual[actual==2] <- 0
+```
+
+```{r, warning=FALSE}
+# 70 minutes to predict 400K observations
+tic()
+
+# Prediction Probabilities
+pred_ens <- predict(mod_ensemble, newdata=testing, type="prob")
+
+toc()
+```
+
+```{r}
+# For this chunk to run, you need to have the InformationValue and MLmetrics packages installed
+our_test_results_ensemble <- tibble(
+  Obs = actual,
+  Y_Prob = pred_ens,
+  Model = "Ensemble")
+
+test_results1 <- our_test_results_ensemble %>%
+  rename(obs2 = Obs, Y = Y_Prob) %>%
+  mutate(
+    pred = ifelse(Y >= 0.5, "yes", "no"),
+    obs = ifelse(obs2 == 0, "no", "yes"),
+    pred2 = ifelse(pred == "yes", 1, 0)
+  ) %>%
+  select(Model, Y, pred, obs, pred2, obs2) %>%
+  group_by(Model) %>%
+  summarize(
+    TN = as.numeric(table(obs2, pred2)[1]),
+    FN = as.numeric(table(obs2, pred2)[2]),
+    FP = as.numeric(table(obs2, pred2)[3]),
+    TP = as.numeric(table(obs2, pred2)[4]),
+    AUROC = InformationValue::AUROC(actuals = obs2, predictedScores = Y),
+    Sensitivity = InformationValue::sensitivity(actuals = obs2, predictedScores = Y),
+    Specificity = InformationValue::specificity(actuals = obs2, predictedScores = Y),
+    `AUPRC` = MLmetrics::PRAUC(y_pred = Y, y_true = obs2),
+    Precision = InformationValue::precision(actuals = obs2, predictedScores = Y),
+    `F1 Score` = 2 * ((Precision * Sensitivity) / (Precision + Sensitivity)),
+    Accuracy = MLmetrics::Accuracy(y_pred = pred2, y_true = obs2),
+    `Log Loss` = MLmetrics::LogLoss(y_pred = Y, y_true = obs2),
+    `Matthews Cor. Coef.` = (TP * TN - FP * FN) / sqrt((TP + FP) * (TP + FN) * (TN + FP) * (TN + FN))
+  ) %>%
+  ungroup() %>%
+  select(-TN, -FN, -FP, -TP)
+```
+
+```{r}
+test_results1 %>% mutate_if(is.numeric,round,4) %>% gather(metric, value)
+```
+
+
+
+

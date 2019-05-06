@@ -1,0 +1,97 @@
+---
+title: "MSD Cleaning & Preprocessing"
+author: "Andrew Kostandy"
+date: "5/5/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(data.table)
+library(tidyverse)
+library(recipes)
+```
+
+```{r}
+training <- fread("msd_training.csv", data.table = FALSE) # uses 50% of your cores by default
+```
+
+```{r}
+# Full Cleaning of SmartScreen
+training <- mutate(training,
+                   SmartScreen = factor(SmartScreen),
+                   SmartScreen = na_if(SmartScreen, ""),
+                   SmartScreen = fct_recode(SmartScreen,
+                                            "x01" = "&#x01;", "x02" = "&#x02;",
+                                            "Off" = "off", "Off" = "OFF", "On" = "on",
+                                            "Prompt" = "prompt", "Prompt" = "Promt",
+                                            "RequireAdmin" = "requireAdmin",
+                                            "RequireAdmin" = "requireadmin",
+                                            "0" = "00000000"
+                                           )
+                  )
+                    
+```
+
+```{r}
+# Making NA a level by itself in categorical variables (For variables with NA values)
+# Also manually merging some very rare levels with the closest levels to them
+# Note that those very rare level are very informative of the outcome so alternative approaches should be considered
+# For now, keeping those very rare levels causes problems with cross validation when using the formula method (~)
+training <- training %>%
+  mutate_if(is.character, as.factor) %>% 
+  mutate_if(is.factor, ~fct_explicit_na(., na_level = "NA"))  #%>% # Optional approach below
+  mutate(Census_OSArchitecture = fct_recode(Census_OSArchitecture, "x86"="arm64"), # merge very rare level arm64 with closest level (optional)
+         Processor = fct_recode(Processor, "x86"="arm64"), # merge very rare level arm64 with closest level x86 (optional)
+         SMode = ifelse(SMode == 1, NA, SMode)) # merge very rare level 1 with closest level NA (optional)
+```
+
+# Approach 1 - Collapsing levels of categorical variables that exist less than 1% of the time.
+
+```{r}
+rec_collapse_lev <- recipe(HasDetections ~ ., data = training) %>% 
+  step_other(all_nominal(), -HasDetections, threshold = 0.01) # Collapses levels occuring less than 1% of the time (calls them other)
+```
+
+```{r}
+prepped_rec_col <- prep(rec_collapse_lev)
+training_col <- juice(prepped_rec_col)
+training_col <- as.data.frame(training_col)
+```
+
+```{r}
+# Run if you wish to save dataset as a csv file
+fwrite(training_col, "msd_training_collapsed_lev.csv")
+```
+
+# Approach 2 - One-hot encoding for all categorical features (data will have 230 columns at the end)
+
+```{r}
+rec_one_hot <- recipe(HasDetections ~ ., data = training) %>% 
+  step_other(all_nominal(), -HasDetections, threshold = 0.01) %>% 
+  step_dummy(all_nominal(), -HasDetections, one_hot = TRUE)
+```
+
+```{r}
+prepped_rec_one_hot <- prep(rec_one_hot)
+training_one_hot <- juice(prepped_rec_one_hot)
+training_one_hot <- as.data.frame(training_one_hot)
+```
+
+```{r}
+# Run if you wish to save dataset as a csv file
+fwrite(training_one_hot, "msd_training_one_hot_collapsed_lev.csv")
+```
+
+
+
+
+
+
+
+
+
+
